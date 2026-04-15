@@ -79,13 +79,10 @@ def fetch_cidrs(url: str) -> list:
     with urllib.request.urlopen(req, timeout=20) as resp:
         html = resp.read().decode("utf-8", errors="ignore")
 
-    seen: set  = set()
+    seen:   set  = set()
     result: list = []
     for m in re.finditer(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})\b', html):
         raw = m.group(1)
-        if raw in seen:
-            continue
-        seen.add(raw)
         try:
             net = ipaddress.IPv4Network(raw, strict=False)
         except ValueError:
@@ -93,7 +90,8 @@ def fetch_cidrs(url: str) -> list:
         if net.prefixlen < 8:   # skip obviously bogus ranges
             continue
         canon = str(net)
-        if canon not in result:
+        if canon not in seen:
+            seen.add(canon)
             result.append(canon)
     return result
 
@@ -141,6 +139,31 @@ def parse_range(text: str):
             pass
 
     return None, None
+
+
+def _interleave(ranges: list) -> list:
+    """Shuffle each range then round-robin interleave across all ranges.
+    Returns a flat deduplicated list of IPs covering all subnets early."""
+    buckets = []
+    for hosts, _ in ranges:
+        bucket = list(hosts)
+        random.shuffle(bucket)
+        buckets.append(bucket)
+    result:   list = []
+    seen_ips: set  = set()
+    iters = [iter(b) for b in buckets]
+    while iters:
+        next_iters = []
+        for it in iters:
+            ip = next(it, None)
+            if ip is None:
+                continue
+            if ip not in seen_ips:
+                seen_ips.add(ip)
+                result.append(ip)
+            next_iters.append(it)
+        iters = next_iters
+    return result
 
 
 def _add_tokens(tokens: list, ranges: list, seen: set):
@@ -850,27 +873,7 @@ def main():
     while True:
         scan_num += 1
 
-        # Re-shuffle and interleave hosts each pass for varied scan order
-        shuffled = []
-        for hosts, desc in ranges:
-            bucket = list(hosts)
-            random.shuffle(bucket)
-            shuffled.append(bucket)
-
-        all_hosts: list = []
-        seen_ips:  set  = set()
-        iters = [iter(b) for b in shuffled]
-        while iters:
-            next_iters = []
-            for it in iters:
-                ip = next(it, None)
-                if ip is None:
-                    continue
-                if ip not in seen_ips:
-                    seen_ips.add(ip)
-                    all_hosts.append(ip)
-                next_iters.append(it)
-            iters = next_iters
+        all_hosts = _interleave(ranges)
 
         if auto_mode:
             print(f"\n{BOLD}{'━' * 52}{RESET}")
@@ -903,7 +906,9 @@ def main():
         # ── Group alive IPs back to their range ───────────────────────────────
         range_alive: list = [[] for _ in ranges]
         for ip in alive:
-            range_alive[ip_to_range[ip]].append(ip)
+            idx = ip_to_range.get(ip)
+            if idx is not None:
+                range_alive[idx].append(ip)
 
         n_alive = len(alive)
         n_dead  = total - n_alive
