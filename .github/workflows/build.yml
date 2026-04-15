@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── Native builds (Windows, macOS Intel, macOS ARM, Linux amd64) ─────────────
   build-native:
     strategy:
       matrix:
@@ -14,13 +13,7 @@ jobs:
           - os: windows-latest
             artifact: ipscaner.exe
             name: ipscaner-windows-amd64
-          - os: macos-12 # Intel x86_64
-            artifact: ipscaner
-            name: ipscaner-macos-intel
-          - os: macos-14 # Apple Silicon arm64
-            artifact: ipscaner
-            name: ipscaner-macos-arm64
-          - os: ubuntu-latest # Linux x86_64
+          - os: ubuntu-latest
             artifact: ipscaner
             name: ipscaner-linux-amd64
 
@@ -43,24 +36,15 @@ jobs:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.artifact }}
 
-  # ── Linux ARM builds via QEMU emulation ──────────────────────────────────────
-  build-linux-arm:
-    strategy:
-      matrix:
-        include:
-          - arch: aarch64
-            name: ipscaner-linux-arm64
-          - arch: armv7
-            name: ipscaner-linux-armv7
-
+  build-linux-arm64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: uraimo/run-on-arch-action@v2
-        name: Build on ${{ matrix.arch }}
+        name: Build on aarch64
         with:
-          arch: ${{ matrix.arch }}
+          arch: aarch64
           distro: ubuntu22.04
           githubToken: ${{ github.token }}
           install: |
@@ -72,5 +56,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: ipscaner-linux-arm64
           path: dist/ipscaner
