@@ -14,7 +14,7 @@ jobs:
           - os: windows-latest
             artifact: ipscaner.exe
             name: ipscaner-windows-amd64
-          - os: macos-13 # Intel x86_64
+          - os: macos-12 # Intel x86_64
             artifact: ipscaner
             name: ipscaner-macos-intel
           - os: macos-14 # Apple Silicon arm64
