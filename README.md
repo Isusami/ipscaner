@@ -1,11 +1,17 @@
 # ipscaner
 
-Fast IP range scanner using raw ICMP sockets — no subprocess per host, live output.
+Fast IP range scanner — ICMP ping sweep or HTTP port-80 probe, live output.
 
 ## Download
 
-- **Windows**: grab `ipscaner.exe` from [Releases](https://github.com/Isusami/ipscaner/releases) or [Actions](https://github.com/Isusami/ipscaner/actions)
-- **macOS / Linux**: run `python3 ip_scanner.py` directly
+Grab the latest binary from [Releases](https://github.com/Isusami/ipscaner/releases):
+
+| Platform | File                                  |
+| -------- | ------------------------------------- |
+| Windows  | `ipscaner.exe` (run as Administrator) |
+| Linux    | `ipscaner-linux-amd64`                |
+
+macOS: run `python3 ip_scanner.py` directly (no root needed).
 
 ## Usage
 
@@ -13,6 +19,7 @@ Fast IP range scanner using raw ICMP sockets — no subprocess per host, live ou
 python3 ip_scanner.py           # interactive mode
 python3 ip_scanner.py ip.txt    # load ranges from file
 ./ipscaner.exe                  # Windows (run as Administrator)
+sudo ./ipscaner-linux-amd64     # Linux
 ```
 
 ### Input modes
@@ -26,46 +33,67 @@ python3 ip_scanner.py ip.txt    # load ranges from file
 | ASN / URL     | `https://ipinfo.io/AS13335`                                  |
 | File          | `python3 ip_scanner.py ranges.txt`                           |
 
+### Scan modes
+
+| Mode   | How it works            | Root needed         | Best for                          |
+| ------ | ----------------------- | ------------------- | --------------------------------- |
+| `icmp` | Raw ICMP echo (default) | Yes (Linux/Windows) | Fast scans on permissive networks |
+| `http` | TCP connect to port 80  | No                  | When ISP/firewall blocks ICMP     |
+
 ### Speed presets
 
-| Preset   | Rate   | Reply wait | Best for                 |
-| -------- | ------ | ---------- | ------------------------ |
-| `fast`   | 5000/s | 1s         | Local / fast networks    |
-| `normal` | 1000/s | 2s         | Internet (default)       |
-| `slow`   | 200/s  | 3s         | Distant / lossy networks |
+| Preset   | ICMP rate | HTTP workers | Reply wait | Best for                 |
+| -------- | --------- | ------------ | ---------- | ------------------------ |
+| `fast`   | 5000/s    | 1000         | 1s         | Local / fast networks    |
+| `normal` | 1000/s    | 500          | 1.5–2s     | Internet (default)       |
+| `slow`   | 200/s     | 200          | 2–3s       | Distant / lossy networks |
+| `auto`   | 200/s     | 300          | —          | Loops forever, appends   |
 
-You can also enter a raw number (e.g. `2000`) for a custom rate.
+You can also enter a raw number (e.g. `2000`) for a custom rate / worker count.
 
 ## Cloudflare preset
 
-Type `cf` at the prompt to instantly load 148 Cloudflare IP ranges (~1.7M IPs) merged from:
+Type `cf` at the prompt to instantly load **944 collapsed ranges (~1.58M IPs)** — no internet required, built into the binary.
 
-- `cloudflare.com/ips-v4` (official CDN ranges)
-- `ipinfo.io/AS13335` (full ASN routing table)
+## Auto scan
 
-No internet required — ranges are built into the binary.
+Choose `auto` as the speed to run the scan in a continuous loop:
+
+- Uses slow settings to avoid rate-limiting
+- Each pass reshuffles host order
+- Results **appended** to the output file — never overwritten
+- Each pass is timestamped in the file: `# --- scan #N  YYYY-MM-DD HH:MM:SS ---`
+- Press Ctrl+C to stop at any time
 
 ## Output
 
-Alive IPs are written to `output.txt` (or your chosen filename) **immediately** as each host responds — one IP per line. The file is safe to read during the scan and survives Ctrl+C with partial results.
+Alive IPs are written to `output.txt` (or your chosen filename) **immediately** as each host responds — one IP per line. Safe to read during the scan.
 
 ```
 1.1.1.1
-1.1.1.2
+1.0.0.1
 104.16.0.5
 ...
 ```
 
 ## How it works
 
-- Sends ICMP Echo Requests from a **single socket** at your chosen rate
+**ICMP mode:**
+
+- Sends ICMP Echo Requests from a single socket at your chosen rate
 - A receiver thread captures replies concurrently — no per-host subprocess overhead
-- IPs are shuffled per subnet and **round-robin interleaved** across all ranges to avoid sequential scan patterns and ensure early hits across all subnets
-- Duplicate IPs are filtered at both parse time and scan time
+- IPs are shuffled per subnet and round-robin interleaved across all ranges
+
+**HTTP mode:**
+
+- Opens a TCP connection to port 80 per host using a thread pool
+- No raw socket required — works without root/admin
+- Bypasses ISPs and firewalls that block ICMP
+- A refused connection (RST) still counts as alive
 
 ### Platform notes
 
-| Platform | Socket type  | Root needed                |
+| Platform | ICMP socket  | Root needed                |
 | -------- | ------------ | -------------------------- |
 | macOS    | `SOCK_DGRAM` | No                         |
 | Linux    | `SOCK_RAW`   | Yes (`sudo`)               |
@@ -80,4 +108,4 @@ pip install pyinstaller
 pyinstaller --onefile --name ipscaner ip_scanner.py
 ```
 
-Windows `.exe` is built automatically via GitHub Actions on every push.
+Windows/Linux binaries are built automatically via GitHub Actions on every push.
