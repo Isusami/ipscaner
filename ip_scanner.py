@@ -801,32 +801,6 @@ def main():
         print(f"{RED}No ranges entered. Exiting.{RESET}")
         return
 
-    # ── Build flat host list — shuffle within each subnet, then interleave ───
-    # Shuffling avoids sequential-scan detection and spreads load across ranges.
-    # The seen set already deduplicates at parse time; this is a safety net.
-    shuffled_ranges = []
-    for hosts, desc in ranges:
-        bucket = list(hosts)
-        random.shuffle(bucket)
-        shuffled_ranges.append(bucket)
-
-    # Round-robin interleave: take one IP from each range in turn so all
-    # subnets are probed early rather than one subnet exhausted first.
-    all_hosts: list = []
-    seen_ips:  set  = set()
-    iters = [iter(b) for b in shuffled_ranges]
-    while iters:
-        next_iters = []
-        for it in iters:
-            ip = next(it, None)
-            if ip is None:
-                continue
-            if ip not in seen_ips:
-                seen_ips.add(ip)
-                all_hosts.append(ip)
-            next_iters.append(it)
-        iters = next_iters
-
     ip_to_range = {h: idx for idx, (hosts, _) in enumerate(ranges) for h in hosts}
 
     try:
@@ -838,21 +812,24 @@ def main():
     print(f"    fast   — 5000/s, 1s wait  (local / fast networks)")
     print(f"    normal — 1000/s, 2s wait  (internet, default)")
     print(f"    slow   —  200/s, 3s wait  (distant / lossy networks)")
+    print(f"    {GREEN}auto{RESET}   — slow speed, repeats forever (appends to output file)")
 
     _presets = {
         "fast":   (5000, 1.0),
         "normal": (1000, 2.0),
         "slow":   (200,  3.0),
+        "auto":   (200,  3.0),
     }
     try:
-        sp_input = input("\nSpeed [fast/normal/slow] : ").strip().lower() or "normal"
+        sp_input = input("\nSpeed [fast/normal/slow/auto] : ").strip().lower() or "normal"
     except EOFError:
         sp_input = "normal"
+
+    auto_mode = (sp_input == "auto")
 
     if sp_input in _presets:
         rate, timeout = _presets[sp_input]
     else:
-        # allow raw number as rate too
         try:
             rate    = int(sp_input)
             timeout = 2.0
@@ -862,55 +839,102 @@ def main():
     rate    = max(1, min(rate, 50000))
     timeout = max(0.5, min(timeout, 30.0))
 
-    total = len(all_hosts)
+    if auto_mode:
+        print(f"\n  {GREEN}Auto scan enabled{RESET} — slow speed, loops until Ctrl+C, "
+              f"results appended to {BOLD}{out_file}{RESET}")
 
-    print(f"\n{BOLD}Scanning {total:,} hosts across {len(ranges)} range(s)  "
-          f"(raw ICMP, {rate}/s, reply wait {timeout:.1f}s){RESET}")
-    print(f"  Live results → {BOLD}{out_file}{RESET}\n")
+    # ── Scan loop (runs once normally, loops forever in auto mode) ────────────
+    scan_num = 0
+    total    = sum(len(h) for h, _ in ranges)
 
-    # ── Open output file — each alive IP written immediately, one per line ──────
-    out_fh = open(out_file, "w")
+    while True:
+        scan_num += 1
 
-    t0    = time.time()
-    alive = fast_scan_icmp(all_hosts, rate=rate, timeout=timeout, out_fh=out_fh)
+        # Re-shuffle and interleave hosts each pass for varied scan order
+        shuffled = []
+        for hosts, desc in ranges:
+            bucket = list(hosts)
+            random.shuffle(bucket)
+            shuffled.append(bucket)
 
-    if alive is None:
-        print(f"{YELLOW}  Raw socket unavailable. Falling back to subprocess ping "
-              f"(try sudo for full speed).{RESET}")
-        alive = scan(all_hosts, workers=200, ping_count=1, out_fh=out_fh)
+        all_hosts: list = []
+        seen_ips:  set  = set()
+        iters = [iter(b) for b in shuffled]
+        while iters:
+            next_iters = []
+            for it in iters:
+                ip = next(it, None)
+                if ip is None:
+                    continue
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
+                    all_hosts.append(ip)
+                next_iters.append(it)
+            iters = next_iters
 
-    out_fh.close()
-    elapsed = time.time() - t0
+        if auto_mode:
+            print(f"\n{BOLD}{'━' * 52}{RESET}")
+            print(f"{BOLD}  Auto scan #{scan_num}{RESET}  "
+                  f"{CYAN}{time.strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
+            print(f"{BOLD}{'━' * 52}{RESET}")
 
-    # ── Group alive IPs back to their range ───────────────────────────────────
-    range_alive: list = [[] for _ in ranges]
-    for ip in alive:
-        range_alive[ip_to_range[ip]].append(ip)
+        print(f"\n{BOLD}Scanning {total:,} hosts across {len(ranges)} range(s)  "
+              f"(raw ICMP, {rate}/s, reply wait {timeout:.1f}s){RESET}")
+        print(f"  Live results → {BOLD}{out_file}{RESET}  "
+              f"{'(append mode)' if auto_mode else ''}\n")
 
-    n_alive = len(alive)
-    n_dead  = total - n_alive
+        # Always append — never overwrite previous results
+        out_fh = open(out_file, "a")
+        if auto_mode:
+            out_fh.write(f"# --- scan #{scan_num}  {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            out_fh.flush()
 
-    # ── Per-range summary ─────────────────────────────────────────────────────
-    print(f"\n{BOLD}{'━' * 52}{RESET}")
-    print(f"{BOLD}  Scan Results — per range{RESET}")
-    print(f"{BOLD}{'━' * 52}{RESET}")
+        t0    = time.time()
+        alive = fast_scan_icmp(all_hosts, rate=rate, timeout=timeout, out_fh=out_fh)
 
-    col = max(len(desc) for _, desc in ranges) + 2
-    for i, (hosts, desc) in enumerate(ranges):
-        a     = len(range_alive[i])
-        color = GREEN if a else RESET
-        print(f"  {desc:{col}}  {color}{a:4d}{RESET} / {len(hosts)} alive")
+        if alive is None:
+            print(f"{YELLOW}  Raw socket unavailable. Falling back to subprocess ping "
+                  f"(try sudo for full speed).{RESET}")
+            alive = scan(all_hosts, workers=200, ping_count=1, out_fh=out_fh)
 
-    print(f"  {'─' * 48}")
-    print(f"  {'Total':{col}}  {GREEN}{n_alive:4d}{RESET} / {total} alive")
-    print(f"  Dead / no reply : {n_dead:,}")
-    print(f"  Duration        : {elapsed:.1f}s")
-    print(f"{BOLD}{'━' * 52}{RESET}")
+        out_fh.close()
+        elapsed = time.time() - t0
 
-    if n_alive:
-        print(f"\n  Results saved to {BOLD}{out_file}{RESET}\n")
-    else:
-        print(f"\n  {YELLOW}No alive hosts found.{RESET}\n")
+        # ── Group alive IPs back to their range ───────────────────────────────
+        range_alive: list = [[] for _ in ranges]
+        for ip in alive:
+            range_alive[ip_to_range[ip]].append(ip)
+
+        n_alive = len(alive)
+        n_dead  = total - n_alive
+
+        # ── Per-range summary ─────────────────────────────────────────────────
+        print(f"\n{BOLD}{'━' * 52}{RESET}")
+        print(f"{BOLD}  Scan Results — per range{RESET}"
+              + (f"  (scan #{scan_num})" if auto_mode else ""))
+        print(f"{BOLD}{'━' * 52}{RESET}")
+
+        col = max(len(desc) for _, desc in ranges) + 2
+        for i, (hosts, desc) in enumerate(ranges):
+            a     = len(range_alive[i])
+            color = GREEN if a else RESET
+            print(f"  {desc:{col}}  {color}{a:4d}{RESET} / {len(hosts)} alive")
+
+        print(f"  {'─' * 48}")
+        print(f"  {'Total':{col}}  {GREEN}{n_alive:4d}{RESET} / {total} alive")
+        print(f"  Dead / no reply : {n_dead:,}")
+        print(f"  Duration        : {elapsed:.1f}s")
+        print(f"{BOLD}{'━' * 52}{RESET}")
+
+        if n_alive:
+            print(f"\n  Results appended to {BOLD}{out_file}{RESET}\n")
+        else:
+            print(f"\n  {YELLOW}No alive hosts found.{RESET}\n")
+
+        if not auto_mode:
+            break
+
+        print(f"  {CYAN}Next scan starting now… (Ctrl+C to stop){RESET}")
 
 
 if __name__ == "__main__":
