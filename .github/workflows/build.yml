@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-native:
+  build:
     strategy:
       matrix:
         include:
@@ -35,26 +35,3 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.artifact }}
-
-  build-linux-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: uraimo/run-on-arch-action@v2
-        name: Build on aarch64
-        with:
-          arch: aarch64
-          distro: ubuntu22.04
-          githubToken: ${{ github.token }}
-          install: |
-            apt-get update -q -y
-            apt-get install -y python3-pip python3-dev binutils
-            pip3 install pyinstaller
-          run: |
-            pyinstaller --onefile --name ipscaner --clean ip_scanner.py
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ipscaner-linux-arm64
-          path: dist/ipscaner
