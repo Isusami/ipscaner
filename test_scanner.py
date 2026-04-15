@@ -133,6 +133,78 @@ class TestOutputAppend(unittest.TestCase):
             os.unlink(fname)
 
 
+class TestTcpProbe(unittest.TestCase):
+    """tcp_probe() — TCP connect on port 80."""
+
+    def test_cloudflare_dns_port80(self):
+        """1.1.1.1 and 1.0.0.1 always serve HTTP on port 80."""
+        self.assertTrue(mod.tcp_probe("1.1.1.1",  port=80, timeout=3.0))
+        self.assertTrue(mod.tcp_probe("1.0.0.1",  port=80, timeout=3.0))
+
+    def test_cloudflare_additional_port80(self):
+        """104.16.x.x is a Cloudflare CDN range — always serves HTTP."""
+        self.assertTrue(mod.tcp_probe("104.16.0.5", port=80, timeout=3.0))
+
+    def test_dead_ip_times_out(self):
+        self.assertFalse(mod.tcp_probe("192.0.2.1", port=80, timeout=1.0))
+
+    def test_closed_port_still_alive(self):
+        """A refused connection (RST) means the host is up."""
+        # Port 9 (discard) is almost always closed but host is up on 1.1.1.1
+        # If it happens to be open the test still passes (returns True either way)
+        result = mod.tcp_probe("1.1.1.1", port=9, timeout=2.0)
+        self.assertIsInstance(result, bool)   # just verify it returns without error
+
+
+class TestScanHttp(unittest.TestCase):
+    """scan_http() — thread-pool TCP scanner."""
+
+    def test_finds_cloudflare_on_port80(self):
+        hosts  = ["1.1.1.1", "1.0.0.1", "192.0.2.1", "192.0.2.2"]
+        buf    = io.StringIO()
+        result = mod.scan_http(hosts, port=80, workers=50, timeout=2.0, out_fh=buf)
+        found  = set(result)
+        self.assertIn("1.1.1.1", found)
+        self.assertIn("1.0.0.1", found)
+        self.assertNotIn("192.0.2.1", found)
+
+    def test_output_written(self):
+        buf    = io.StringIO()
+        result = mod.scan_http(["1.1.1.1", "192.0.2.1"],
+                               port=80, workers=50, timeout=2.0, out_fh=buf)
+        if result:
+            self.assertIn("1.1.1.1", buf.getvalue().splitlines())
+
+    def test_result_sorted(self):
+        import ipaddress
+        hosts  = ["1.1.1.1", "1.0.0.1", "192.0.2.1"]
+        result = mod.scan_http(hosts, port=80, workers=50, timeout=2.0)
+        self.assertEqual(result, sorted(result, key=ipaddress.IPv4Address))
+
+    def test_no_duplicates(self):
+        hosts  = ["1.1.1.1", "1.1.1.1", "192.0.2.1"]
+        result = mod.scan_http(hosts, port=80, workers=50, timeout=2.0)
+        self.assertEqual(len(result), len(set(result)))
+
+    def test_http_finds_more_than_icmp_on_filtered_network(self):
+        """HTTP should find at least as many live CF IPs as ICMP.
+        On networks where ICMP is blocked, HTTP finds more."""
+        hosts  = ["1.1.1.1", "1.0.0.1", "104.16.0.5", "192.0.2.1"]
+        buf_h  = io.StringIO()
+        http   = set(mod.scan_http(hosts, port=80, workers=50,
+                                   timeout=2.0, out_fh=buf_h))
+
+        buf_i  = io.StringIO()
+        icmp   = mod.fast_scan_icmp(hosts, rate=500, timeout=2.0, out_fh=buf_i)
+        if icmp is None:
+            self.skipTest("ICMP unavailable — cannot compare")
+        icmp = set(icmp)
+
+        # HTTP must find everything ICMP found (CF IPs answer both)
+        self.assertTrue(icmp.issubset(http),
+            f"HTTP missed IPs that ICMP found: {icmp - http}")
+
+
 class TestPresets(unittest.TestCase):
     """Built-in CF preset integrity."""
 

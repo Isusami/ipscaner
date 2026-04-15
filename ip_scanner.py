@@ -647,31 +647,14 @@ def fast_scan_icmp(hosts: list, rate: int = 1000, timeout: float = 2.0,
     return alive
 
 
-# ── Fallback scanner (subprocess ping, used if raw sockets unavailable) ───────
-def _worker(ip_q: queue.Queue, out_q: queue.Queue, ping_count: int):
-    while True:
-        try:
-            ip = ip_q.get_nowait()
-        except queue.Empty:
-            return
-        out_q.put((ip, ping(ip, ping_count)))
-        ip_q.task_done()
-
-
-def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None):
-    ip_q: queue.Queue = queue.Queue()
-    out_q: queue.Queue = queue.Queue()
-    for h in hosts:
-        ip_q.put(h)
-
-    for _ in range(min(workers, len(hosts))):
-        threading.Thread(target=_worker, args=(ip_q, out_q, ping_count), daemon=True).start()
-
-    total     = len(hosts)
+# ── Shared progress-bar collector (used by both ping and HTTP scanners) ───────
+def _collect_results(out_q: queue.Queue, total: int, out_fh=None) -> list:
+    """Drain out_q of (ip, bool) pairs, print live results, return sorted alive list."""
     done      = 0
-    alive     = []
+    alive:     list = []
+    alive_set: set  = set()
     t_start   = time.time()
-    t_refresh = 0.0   # last time the progress bar was redrawn
+    t_refresh = 0.0
 
     sys.stdout.write("\n")
 
@@ -679,7 +662,8 @@ def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None):
         try:
             ip, is_alive = out_q.get(timeout=0.2)
             done += 1
-            if is_alive:
+            if is_alive and ip not in alive_set:
+                alive_set.add(ip)
                 alive.append(ip)
                 sys.stdout.write(f"{CL}  {GREEN}●{RESET} {ip}\n")
                 sys.stdout.flush()
@@ -691,10 +675,10 @@ def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None):
             pass
 
         now = time.time()
-        if now - t_refresh >= 0.25:          # redraw at most ~4× per second
+        if now - t_refresh >= 0.25:
             elapsed = now - t_start
-            rate    = done / elapsed if elapsed > 0 else 0
-            remain  = (total - done) / rate  if rate  > 0 else 0
+            spd     = done / elapsed if elapsed > 0 else 0
+            remain  = (total - done) / spd if spd > 0 else 0
             if remain >= 3600:
                 eta = f"{int(remain // 3600)}h{int((remain % 3600) // 60):02d}m"
             elif remain >= 60:
@@ -705,7 +689,7 @@ def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None):
                 f"{CL}{CYAN}{bar(done, total)}{RESET}"
                 f"  {done:,}/{total:,}"
                 f"  {GREEN}alive:{len(alive)}{RESET}"
-                f"  {rate:.0f}/s"
+                f"  {spd:.0f}/s"
                 f"  ETA:{eta}"
             )
             sys.stdout.flush()
@@ -713,9 +697,73 @@ def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None):
 
     sys.stdout.write(CL)
     sys.stdout.flush()
-
     alive.sort(key=ipaddress.IPv4Address)
     return alive
+
+
+# ── Fallback scanner (subprocess ping, used if raw sockets unavailable) ───────
+def _worker_ping(ip_q: queue.Queue, out_q: queue.Queue, ping_count: int):
+    while True:
+        try:
+            ip = ip_q.get_nowait()
+        except queue.Empty:
+            return
+        out_q.put((ip, ping(ip, ping_count)))
+        ip_q.task_done()
+
+
+def scan(hosts: list, workers: int = 50, ping_count: int = 1, out_fh=None) -> list:
+    ip_q:  queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+    for h in hosts:
+        ip_q.put(h)
+    for _ in range(min(workers, len(hosts))):
+        threading.Thread(target=_worker_ping,
+                         args=(ip_q, out_q, ping_count), daemon=True).start()
+    return _collect_results(out_q, len(hosts), out_fh)
+
+
+# ── HTTP/TCP probe scanner (works through ICMP-blocking firewalls) ────────────
+def tcp_probe(ip: str, port: int = 80, timeout: float = 1.5) -> bool:
+    """Return True if ip accepts (or refuses) a TCP connection on port.
+    A refused connection (RST) still means the host is up."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return True
+    except ConnectionRefusedError:
+        return True   # RST = host is alive, port just closed
+    except (socket.timeout, OSError):
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _worker_http(ip_q: queue.Queue, out_q: queue.Queue, port: int, timeout: float):
+    while True:
+        try:
+            ip = ip_q.get_nowait()
+        except queue.Empty:
+            return
+        out_q.put((ip, tcp_probe(ip, port, timeout)))
+        ip_q.task_done()
+
+
+def scan_http(hosts: list, port: int = 80, workers: int = 500,
+              timeout: float = 1.5, out_fh=None) -> list:
+    """Thread-pool TCP-connect scanner. No root needed, bypasses ICMP blocks."""
+    ip_q:  queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+    for h in hosts:
+        ip_q.put(h)
+    for _ in range(min(workers, len(hosts))):
+        threading.Thread(target=_worker_http,
+                         args=(ip_q, out_q, port, timeout), daemon=True).start()
+    return _collect_results(out_q, len(hosts), out_fh)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -831,18 +879,42 @@ def main():
     except EOFError:
         out_file = "output.txt"
 
-    print(f"\n  {BOLD}Speed presets:{RESET}")
-    print(f"    fast   — 5000/s, 1s wait  (local / fast networks)")
-    print(f"    normal — 1000/s, 2s wait  (internet, default)")
-    print(f"    slow   —  200/s, 3s wait  (distant / lossy networks)")
-    print(f"    {GREEN}auto{RESET}   — slow speed, repeats forever (appends to output file)")
+    # ── Scan mode ─────────────────────────────────────────────────────────────
+    print(f"\n  {BOLD}Scan mode:{RESET}")
+    print(f"    {CYAN}icmp{RESET}  — raw ICMP echo  (fast, needs root on Linux/Windows)")
+    print(f"    {CYAN}http{RESET}  — TCP port 80    (no root, works through ICMP blocks)")
+    try:
+        mode_input = input("\nMode [icmp/http] : ").strip().lower() or "icmp"
+    except EOFError:
+        mode_input = "icmp"
+    http_mode = (mode_input == "http")
 
-    _presets = {
-        "fast":   (5000, 1.0),
-        "normal": (1000, 2.0),
-        "slow":   (200,  3.0),
-        "auto":   (200,  3.0),
-    }
+    # ── Speed / workers ───────────────────────────────────────────────────────
+    if http_mode:
+        print(f"\n  {BOLD}Workers (concurrent TCP connections):{RESET}")
+        print(f"    fast   — 1000 workers, 1.0s timeout")
+        print(f"    normal —  500 workers, 1.5s timeout  (default)")
+        print(f"    slow   —  200 workers, 2.0s timeout")
+        print(f"    {GREEN}auto{RESET}   — 300 workers, repeats forever")
+        _presets = {
+            "fast":   (1000, 1.0),
+            "normal": (500,  1.5),
+            "slow":   (200,  2.0),
+            "auto":   (300,  1.5),
+        }
+    else:
+        print(f"\n  {BOLD}Speed presets:{RESET}")
+        print(f"    fast   — 5000/s, 1s wait  (local / fast networks)")
+        print(f"    normal — 1000/s, 2s wait  (internet, default)")
+        print(f"    slow   —  200/s, 3s wait  (distant / lossy networks)")
+        print(f"    {GREEN}auto{RESET}   — slow speed, repeats forever")
+        _presets = {
+            "fast":   (5000, 1.0),
+            "normal": (1000, 2.0),
+            "slow":   (200,  3.0),
+            "auto":   (200,  3.0),
+        }
+
     try:
         sp_input = input("\nSpeed [fast/normal/slow/auto] : ").strip().lower() or "normal"
     except EOFError:
@@ -855,15 +927,19 @@ def main():
     else:
         try:
             rate    = int(sp_input)
-            timeout = 2.0
+            timeout = 1.5 if http_mode else 2.0
         except ValueError:
             rate, timeout = _presets["normal"]
 
-    rate    = max(1, min(rate, 50000))
+    if http_mode:
+        rate    = max(1, min(rate, 5000))
+    else:
+        rate    = max(1, min(rate, 50000))
     timeout = max(0.5, min(timeout, 30.0))
 
     if auto_mode:
-        print(f"\n  {GREEN}Auto scan enabled{RESET} — slow speed, loops until Ctrl+C, "
+        mode_label = "HTTP port 80" if http_mode else "raw ICMP"
+        print(f"\n  {GREEN}Auto scan enabled{RESET} — {mode_label}, loops until Ctrl+C, "
               f"results appended to {BOLD}{out_file}{RESET}")
 
     # ── Scan loop (runs once normally, loops forever in auto mode) ────────────
@@ -881,8 +957,13 @@ def main():
                   f"{CYAN}{time.strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
             print(f"{BOLD}{'━' * 52}{RESET}")
 
+        if http_mode:
+            mode_desc = f"TCP port 80, {rate} workers, {timeout:.1f}s timeout"
+        else:
+            mode_desc = f"raw ICMP, {rate}/s, reply wait {timeout:.1f}s"
+
         print(f"\n{BOLD}Scanning {total:,} hosts across {len(ranges)} range(s)  "
-              f"(raw ICMP, {rate}/s, reply wait {timeout:.1f}s){RESET}")
+              f"({mode_desc}){RESET}")
         print(f"  Live results → {BOLD}{out_file}{RESET}  "
               f"{'(append mode)' if auto_mode else ''}\n")
 
@@ -892,13 +973,17 @@ def main():
             out_fh.write(f"# --- scan #{scan_num}  {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             out_fh.flush()
 
-        t0    = time.time()
-        alive = fast_scan_icmp(all_hosts, rate=rate, timeout=timeout, out_fh=out_fh)
+        t0 = time.time()
 
-        if alive is None:
-            print(f"{YELLOW}  Raw socket unavailable. Falling back to subprocess ping "
-                  f"(try sudo for full speed).{RESET}")
-            alive = scan(all_hosts, workers=200, ping_count=1, out_fh=out_fh)
+        if http_mode:
+            alive = scan_http(all_hosts, port=80, workers=rate,
+                              timeout=timeout, out_fh=out_fh)
+        else:
+            alive = fast_scan_icmp(all_hosts, rate=rate, timeout=timeout, out_fh=out_fh)
+            if alive is None:
+                print(f"{YELLOW}  Raw socket unavailable. Falling back to subprocess ping "
+                      f"(try sudo for full speed).{RESET}")
+                alive = scan(all_hosts, workers=200, ping_count=1, out_fh=out_fh)
 
         out_fh.close()
         elapsed = time.time() - t0
