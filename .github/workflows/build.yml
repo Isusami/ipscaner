@@ -6,22 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ── Native builds (Windows, macOS Intel, macOS ARM, Linux amd64) ─────────────
+  build-native:
     strategy:
       matrix:
         include:
           - os: windows-latest
             artifact: ipscaner.exe
-            name: ipscaner-windows
-          - os: macos-latest
+            name: ipscaner-windows-amd64
+          - os: macos-13 # Intel x86_64
             artifact: ipscaner
-            name: ipscaner-macos
-          - os: ubuntu-latest
+            name: ipscaner-macos-intel
+          - os: macos-14 # Apple Silicon arm64
             artifact: ipscaner
-            name: ipscaner-linux
+            name: ipscaner-macos-arm64
+          - os: ubuntu-latest # Linux x86_64
+            artifact: ipscaner
+            name: ipscaner-linux-amd64
 
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +38,39 @@ jobs:
       - name: Build binary
         run: pyinstaller --onefile --name ipscaner --clean ip_scanner.py
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.artifact }}
+
+  # ── Linux ARM builds via QEMU emulation ──────────────────────────────────────
+  build-linux-arm:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            name: ipscaner-linux-arm64
+          - arch: armv7
+            name: ipscaner-linux-armv7
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: uraimo/run-on-arch-action@v2
+        name: Build on ${{ matrix.arch }}
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -q -y
+            apt-get install -y python3-pip python3-dev binutils
+            pip3 install pyinstaller
+          run: |
+            pyinstaller --onefile --name ipscaner --clean ip_scanner.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/ipscaner
