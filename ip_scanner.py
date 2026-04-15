@@ -533,13 +533,12 @@ def fast_scan_icmp(hosts: list, rate: int = 1000, timeout: float = 2.0,
     out_lock   = threading.Lock()   # serialize stdout between sender + receiver
 
     # Try unprivileged datagram socket first (macOS), then raw (Linux/root)
-    raw_mode = False
+    # Both socket types return the full IP packet (20-byte header + ICMP) on recv.
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
     except (PermissionError, OSError):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-            raw_mode = True
         except PermissionError:
             return None   # signal caller to fall back
 
@@ -557,9 +556,9 @@ def fast_scan_icmp(hosts: list, rate: int = 1000, timeout: float = 2.0,
             src_ip = addr[0]
             if src_ip not in target_set or src_ip in alive_set:
                 continue
-            # SOCK_RAW includes 20-byte IP header; SOCK_DGRAM strips it
-            offset = 20 if raw_mode else 0
-            if len(data) < offset + 1 or data[offset] != 0:   # 0 = Echo Reply
+            # Both SOCK_RAW and SOCK_DGRAM return the full IP packet;
+            # skip the 20-byte IP header to reach the ICMP type byte.
+            if len(data) < 21 or data[20] != 0:   # 0 = Echo Reply
                 continue
             alive_set.add(src_ip)
             alive.append(src_ip)
