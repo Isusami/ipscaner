@@ -10,7 +10,6 @@ Uses raw ICMP sockets for fast scanning (no subprocess per host), shows live pro
 import os
 import random
 import re
-import select
 import socket
 import struct
 import subprocess
@@ -25,6 +24,15 @@ import urllib.error
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
+# Enable ANSI on Windows (needed for color + \033[K to work in cmd/PowerShell)
+if platform.system() == "Windows":
+    import ctypes
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -41,9 +49,15 @@ def bar(current, total, width=28):
 
 # ── Ping ──────────────────────────────────────────────────────────────────────
 _IS_MAC = platform.system() == "Darwin"
+_IS_WIN = platform.system() == "Windows"
 
 def ping(ip: str, count: int = 1) -> bool:
-    cmd = ["ping", "-c", str(count), "-W", "1000" if _IS_MAC else "1", ip]
+    if _IS_WIN:
+        cmd = ["ping", "-n", str(count), "-w", "1000", ip]
+    elif _IS_MAC:
+        cmd = ["ping", "-c", str(count), "-W", "1000", ip]
+    else:
+        cmd = ["ping", "-c", str(count), "-W", "1", ip]
     return subprocess.run(cmd, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL).returncode == 0
 
@@ -529,16 +543,15 @@ def fast_scan_icmp(hosts: list, rate: int = 1000, timeout: float = 2.0,
         except PermissionError:
             return None   # signal caller to fall back
 
-    sock.setblocking(False)
+    sock.settimeout(0.1)   # non-blocking-compatible on all platforms incl. Windows
     stop_recv = threading.Event()
 
     def _receiver():
         while not stop_recv.is_set():
-            r, _, _ = select.select([sock], [], [], 0.1)
-            if not r:
-                continue
             try:
                 data, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
             except OSError:
                 continue
             src_ip = addr[0]
